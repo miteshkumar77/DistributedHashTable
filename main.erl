@@ -1,5 +1,5 @@
 -module(main).
--export([start/0, actorEl/4, stdinReadLoop/0]).
+-export([start/0, actorEntry/4, stdinReadLoop/0]).
 %-compile(export_all).
 
 % NOTE: Any function called with spawn/ MUST be exported
@@ -8,8 +8,13 @@
 % You also need to export a function to create an explicit reference to
 % it for higher-order programming.
 
-getPid(N) ->
-  list_to_atom(lists:flatten(io_lib:format("p~p", [N]))).
+getRandomNode() ->
+  World = net_adm:world(),
+  Rand = rand:uniform(length(World)),
+  lists:nth(Rand, World).
+
+getPid(N, PidMap) ->
+  maps:get(N, PidMap).
 
 normed(Curr, Node, Nodes) -> (Node - Curr + Nodes) rem Nodes.
 
@@ -29,8 +34,13 @@ appendMapList(Map, Key, Val) ->
       end,
   maps:update_with(Key, A, [Val], Map).
 
+actorEntry(Me, LocalMap, Awaiting, Nodes) ->
+  receive
+    M ->
+      actorEl(Me, M, LocalMap, Awaiting, Nodes)
+  end.
 
-actorEl(Me, LocalMap, Awaiting, Nodes) ->
+actorEl(Me, PIDMap, LocalMap, Awaiting, Nodes) ->
   % io:fwrite("ActorEl for Process [~b] started...~n", [Me]),
   receive
     {insert, [Origin, Key, Value]} ->
@@ -46,19 +56,19 @@ actorEl(Me, LocalMap, Awaiting, Nodes) ->
                           self() ! {query, Args}
                       end,
               lists:foreach(SFunc, QList),
-              actorEl(Me, maps:put(Key, Value, LocalMap), maps:remove(Key,
+              actorEl(Me, PIDMap, maps:put(Key, Value, LocalMap), maps:remove(Key,
                                                                       Awaiting),
                       Nodes);
             error ->
-              actorEl(Me, maps:put(Key, Value, LocalMap), Awaiting, Nodes)
+              actorEl(Me, PIDMap, maps:put(Key, Value, LocalMap), Awaiting, Nodes)
           end;
         true ->
           NextNode = nextHop(Me, Dst, Nodes),
           %io:fwrite("Process [~b] Sending insert{~s => ~s} from origin Process
           %[~b] to next hop process [~b] with destination process [~b]~n", [Me, Key, Value, Origin,
                                              %NextNode, Dst]),
-          getPid(NextNode) ! {insert, [Origin, Key, Value]},
-          actorEl(Me, LocalMap, Awaiting, Nodes)
+          getPid(NextNode, PIDMap) ! {insert, [Origin, Key, Value]},
+          actorEl(Me, PIDMap, LocalMap, Awaiting, Nodes)
       end;
     {query, [QID, Origin, Key]} ->
       Dst = util:hash(Key, Nodes),
@@ -66,46 +76,46 @@ actorEl(Me, LocalMap, Awaiting, Nodes) ->
         Dst == Me ->
           case maps:find(Key, LocalMap) of
             {ok, Value} ->
-              clientPID ! {result, [QID, Origin, Key, Value]},
-              actorEl(Me, LocalMap, Awaiting, Nodes);
+              getPid(-1, PIDMap) ! {result, [QID, Origin, Key, Value]},
+              actorEl(Me, PIDMap, LocalMap, Awaiting, Nodes);
             error ->
-              actorEl(Me, LocalMap, appendMapList(Awaiting, Key, 
+              actorEl(Me, PIDMap, LocalMap, appendMapList(Awaiting, Key, 
                                                   [QID, Origin, Key]), Nodes)
           end;
         true ->
           NextNode = nextHop(Me, Dst, Nodes),
-          getPid(NextNode) ! {query, [QID, Origin, Key]},
-          actorEl(Me, LocalMap, Awaiting, Nodes)
+          getPid(NextNode, PIDMap) ! {query, [QID, Origin, Key]},
+          actorEl(Me, PIDMap, LocalMap, Awaiting, Nodes)
       end
   end.
 
+%register(getPid(N-1), spawn(getRandomNode(), main, actorEl, [N-1, #{}, #{}, Nodes])),
 startActors(N, Nodes) ->
   if
     N > 0 ->
-      register(getPid(N-1), spawn(main, actorEl, [N-1, #{}, #{}, Nodes])),
-      startActors(N-1, Nodes);
-    true -> 0
+      System = getRandomNode(),
+      PID = spawn(System, main, actorEntry, [N-1, #{}, #{}, Nodes]),
+      maps:merge(#{N => PID}, startActors(N-1, Nodes));
+    true -> #{-1 => self()}
   end.
 
-handleInsert(Origin, Key, Value) -> 
-	io:format("inserting key=~s value=~s origin=~b~n", [Key,Value,Origin]),
-  getPid(Origin) ! {insert, [Origin, Key, Value]}.
-handleQuery(QID, Origin, Key) ->
-	io:format("querying key=~s starting at node=~b ID=~b~n", [Key, Origin, QID]),
-  getPid(Origin) ! {query, [QID, Origin, Key]}.
+handleInsert(Origin, Key, Value, PIDMap) -> 
+  getPid(Origin, PIDMap) ! {insert, [Origin, Key, Value]}.
+handleQuery(QID, Origin, Key, PIDMap) ->
+  getPid(Origin, PIDMap) ! {query, [QID, Origin, Key]}.
 handleResult(QID, Origin, Key, Value, Nodes) ->
   io:format("Request ~b sent to agent ~b: Value for key \"~s\" stored in node ~b: \"~s\"~n", [QID, Origin, Key, util:hash(Key, Nodes), Value]).
 
-processRequests(Nodes) ->
+processRequests(Nodes, PIDMap) ->
   receive
     {insert, [Origin, Key, Value]} ->
-      handleInsert(Origin, Key, Value);
+      handleInsert(Origin, Key, Value, PIDMap);
     {query, [QID, Origin, Key]} ->
-      handleQuery(QID, Origin, Key);
+      handleQuery(QID, Origin, Key, PIDMap);
     {result, [QID, Origin, Key, Value]} ->
       handleResult(QID, Origin, Key, Value, Nodes)
   end,
-  processRequests(Nodes).
+  processRequests(Nodes, PIDMap).
 
 stdinReadLoop() ->
   {ok, [RequestString]} = io:fread("", "~s"),
@@ -124,9 +134,18 @@ stdinReadLoop() ->
 start() ->
 	{ok, [N]} = io:fread("", "~d"),
 	Nodes = round(math:pow(2, N)),
-  startActors(Nodes, Nodes),
-	io:format("With ~b nodes, key \"test\" belongs in node ~b~n", [Nodes, util:hash("test", Nodes)]),
+  PIDMap = startActors(Nodes, Nodes),
+  F = fun (K, V) ->
+          if
+            K >= 0 ->
+              V ! PIDMap,
+              0;
+            true -> 0
+          end
+      end,
+  maps:foreach(F, PIDMap),
   register(clientPID, self()),
   spawn(main, stdinReadLoop, []),
-  processRequests(Nodes).
+  processRequests(Nodes, PIDMap).
   
+%io:format("With ~b nodes, key \"test\" belongs in node ~b~n", [Nodes, util:hash("test", Nodes)]),
