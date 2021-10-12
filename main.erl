@@ -34,25 +34,50 @@ appendMapList(Map, Key, Val) ->
       end,
   maps:update_with(Key, A, [Val], Map).
 
-actorEntry(Me, LocalMap, Awaiting, Nodes) ->
-  receive
-    M ->
-      actorEl(Me, M, LocalMap, Awaiting, Nodes)
+
+
+
+strPIDs(PIDMap, Nodes, Cur) ->
+  if
+    Nodes == Cur -> "";
+    true ->
+      PID = maps:get(Cur, PIDMap),
+      lists:flatten(io_lib:fwrite("{ index: ~b, pid: ~w } ~s", [Cur, PID, strPIDs(PIDMap, Nodes, Cur+1)]))
   end.
 
+actorEntry(Me, LocalMap, Awaiting, Nodes) ->
+  receive
+    PIDMap ->
+      processDbg(Me, strPIDs(PIDMap, Nodes, 0), []),
+      actorEl(Me, PIDMap, LocalMap, Awaiting, Nodes)
+  end.
+
+queryStr(Args, Nodes) ->
+  [_, _, Key] = Args,
+  lists:flatten(io_lib:fwrite("Query{ qid: ~b, origin: ~b, key: ~s, destination: ~b }", 
+                              lists:append(Args, [util:hash(Key, Nodes)]))).
+
+insertStr(Args, Nodes) ->
+  [_, Key, _] = Args,
+  lists:flatten(io_lib:fwrite("Insert{ origin: ~b, key: ~s, value: ~s, destination: ~b }", 
+                              lists:append(Args, [util:hash(Key, Nodes)]))).
+
+processDbg(Me, FStr, Output) ->
+  io:fwrite("Process[~b]: ~s~n", [Me, lists:flatten(io_lib:fwrite(FStr,
+                                                                  Output))]).
+
 actorEl(Me, PIDMap, LocalMap, Awaiting, Nodes) ->
-  % io:fwrite("ActorEl for Process [~b] started...~n", [Me]),
+  processDbg(Me, "ActorEl started", []),
   receive
     {insert, [Origin, Key, Value]} ->
       Dst = util:hash(Key, Nodes),
       if
         Dst == Me ->
-          %io:fwrite("Process [~b] Inserting {~s => ~s} from origin Process
-                    %[~b] with destination Process [~b]~n", [Me, Key, Value,
-                                                            %Origin, Dst]),
+          processDbg(Me, "Destination of ~s Reached", [insertStr([Origin, Key, Value], Nodes)]),
           case maps:find(Key, Awaiting) of
             {ok, QList} ->
               SFunc = fun (Args) ->
+                          processDbg(Me, "Re-Queuing ~s", [queryStr(Args, Nodes)]),
                           self() ! {query, Args}
                       end,
               lists:foreach(SFunc, QList),
@@ -64,9 +89,7 @@ actorEl(Me, PIDMap, LocalMap, Awaiting, Nodes) ->
           end;
         true ->
           NextNode = nextHop(Me, Dst, Nodes),
-          %io:fwrite("Process [~b] Sending insert{~s => ~s} from origin Process
-          %[~b] to next hop process [~b] with destination process [~b]~n", [Me, Key, Value, Origin,
-                                             %NextNode, Dst]),
+          processDbg(Me, "In Transit: ~s, next hop: Process[~b]", [insertStr([Origin, Key, Value], Nodes), NextNode]),
           getPid(NextNode, PIDMap) ! {insert, [Origin, Key, Value]},
           actorEl(Me, PIDMap, LocalMap, Awaiting, Nodes)
       end;
@@ -77,13 +100,16 @@ actorEl(Me, PIDMap, LocalMap, Awaiting, Nodes) ->
           case maps:find(Key, LocalMap) of
             {ok, Value} ->
               getPid(-1, PIDMap) ! {result, [QID, Origin, Key, Value]},
+              processDbg(Me, "Destination of ~s Reached and fulfilled", [queryStr([QID, Origin, Key], Nodes)]),
               actorEl(Me, PIDMap, LocalMap, Awaiting, Nodes);
             error ->
+              processDbg(Me, "Destination of ~s Reached and waiting", [queryStr([QID, Origin, Key], Nodes)]),
               actorEl(Me, PIDMap, LocalMap, appendMapList(Awaiting, Key, 
                                                   [QID, Origin, Key]), Nodes)
           end;
         true ->
           NextNode = nextHop(Me, Dst, Nodes),
+          processDbg(Me, "In Transit: ~s, next hop: Process[~b]", [queryStr([QID, Origin, Key], Nodes), NextNode]),
           getPid(NextNode, PIDMap) ! {query, [QID, Origin, Key]},
           actorEl(Me, PIDMap, LocalMap, Awaiting, Nodes)
       end
@@ -93,9 +119,8 @@ actorEl(Me, PIDMap, LocalMap, Awaiting, Nodes) ->
 startActors(N, Nodes) ->
   if
     N > 0 ->
-      System = getRandomNode(),
-      PID = spawn(System, main, actorEntry, [N-1, #{}, #{}, Nodes]),
-      maps:merge(#{N => PID}, startActors(N-1, Nodes));
+      PID = spawn(getRandomNode(), main, actorEntry, [N-1, #{}, #{}, Nodes]),
+      maps:merge(#{N-1 => PID}, startActors(N-1, Nodes));
     true -> #{-1 => self()}
   end.
 
